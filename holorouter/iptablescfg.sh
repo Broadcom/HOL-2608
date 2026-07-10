@@ -155,5 +155,5 @@ echo "" > ~holuser/firewall
 # Runs in the background so iptables setup is not delayed.
 if [ -f /tmp/holorouter/fix-dnsmasq-resilience.sh ]; then
     nohup bash /tmp/holorouter/fix-dnsmasq-resilience.sh \
-        >/var/log/dnsmasq-resilience-fix.log 2>&1 &
+        >/tmp/dnsmasq-resilience-fix.log 2>&1 &
 fi
