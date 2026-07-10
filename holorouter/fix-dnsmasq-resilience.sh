@@ -1,6 +1,6 @@
 #!/bin/bash
 # fix-dnsmasq-resilience.sh
-# Version: 2026-07-10b
+# Version: 2026-07-10c
 #
 # Idempotent prep script: hardens the dnsmasq K8s Deployment on the holorouter
 # before golden template capture.
@@ -235,12 +235,22 @@ except ApiException as e:
 PYEOF
 ok "remove_dns_entry.py written"
 
-# ── Step 3: Apply updated Deployment YAML ─────────────────────────────────────
+# ── Step 3: Update Deployment (two-phase to avoid DNS gap during labstartup) ───
+#
+# Phase A — patch strategy only (non-disruptive, no pod restart).
+#   Changing spec.strategy does NOT restart running pods; it only governs how
+#   the *next* pod update is performed.
+#
+# Phase B — apply template changes (probes, priorityClass, grace period).
+#   These are spec.template changes and DO trigger a pod restart (~15-20s DNS
+#   gap).  We defer this until lsf.write_vpodprogress('READY') fires, which
+#   writes /tmp/holorouter/ready onto the router.  By then labstartup is done
+#   and a brief post-ready DNS hiccup is far less disruptive than a mid-startup
+#   outage.  On subsequent runs the probes already exist so Phase B is skipped.
 
-info "Step 3: Applying updated dnsmasq Deployment..."
+info "Step 3: Configuring dnsmasq Deployment..."
 
-# Write the target deployment YAML to the runtime directory then apply.
-# kubectl apply is idempotent: no-ops if the cluster state already matches.
+# Always write the target YAML to disk (used by Phase B apply).
 cat > "${DNSMASQ_DIR}/dnsmasq_deployment.yaml" << 'YAMEOF'
 apiVersion: apps/v1
 kind: Deployment
@@ -327,17 +337,50 @@ spec:
             name: dnsmasq
 YAMEOF
 
-kubectl apply -f "${DNSMASQ_DIR}/dnsmasq_deployment.yaml"
-ok "Deployment YAML applied"
+# ── Phase A: Patch strategy to Recreate (non-disruptive) ──────────────────────
+CURRENT_STRATEGY=$(kubectl get deployment dnsmasq-deployment -n default \
+  -o jsonpath='{.spec.strategy.type}')
 
-# ── Step 4: Wait for pod to be Ready ──────────────────────────────────────────
-
-info "Step 4: Waiting for dnsmasq pod to be Ready (up to 60s)..."
-
-if kubectl rollout status deployment/dnsmasq-deployment -n default --timeout=60s; then
-  ok "dnsmasq pod is Ready"
+if [[ "$CURRENT_STRATEGY" != "Recreate" ]]; then
+  info "Phase A: Patching strategy to Recreate (no pod restart)..."
+  kubectl patch deployment dnsmasq-deployment -n default \
+    --type=merge -p '{"spec":{"strategy":{"type":"Recreate","rollingUpdate":null}}}'
+  ok "Strategy patched to Recreate"
 else
-  die "dnsmasq pod did not become Ready within 60s — check: kubectl describe pod -l app=dnsmasq"
+  ok "Phase A: Strategy already Recreate"
+fi
+
+# ── Phase B: Apply template changes (deferred until labstartup is READY) ──────
+# Check whether probes are already present — if yes, skip entirely.
+HAS_LIVENESS=$(kubectl get deployment dnsmasq-deployment -n default \
+  -o jsonpath='{.spec.template.spec.containers[0].livenessProbe}' 2>/dev/null)
+
+if [[ -z "$HAS_LIVENESS" ]]; then
+  info "Phase B: Template changes needed (probes, priorityClass, grace period)."
+  info "  Waiting for labstartup READY signal to avoid a DNS gap during startup..."
+  info "  (/tmp/holorouter/ready — written by lsf.write_vpodprogress READY)"
+  _w=0; _max=5400  # wait up to 90 min for long VCF startups
+  until [[ -f /tmp/holorouter/ready ]] || [[ $_w -ge $_max ]]; do
+    sleep 15; _w=$((_w + 15))
+  done
+  if [[ -f /tmp/holorouter/ready ]]; then
+    ok "Phase B: Labstartup READY (${_w}s). Applying template changes..."
+  else
+    info "Phase B: READY timeout after ${_w}s — applying anyway"
+  fi
+  kubectl apply -f "${DNSMASQ_DIR}/dnsmasq_deployment.yaml"
+  ok "Deployment YAML applied"
+
+  # ── Step 4: Wait for pod Ready (only needed when pod actually restarts) ──────
+  info "Step 4: Waiting for dnsmasq pod to be Ready (up to 60s)..."
+  if kubectl rollout status deployment/dnsmasq-deployment -n default --timeout=60s; then
+    ok "dnsmasq pod is Ready"
+  else
+    die "Pod did not become Ready within 60s — check: kubectl describe pod -l app=dnsmasq"
+  fi
+else
+  ok "Phase B: Template already up to date — no pod restart needed"
+  info "Step 4: Skipped (no pod restart required)"
 fi
 
 # ── Step 5: Verify DNS is responding ──────────────────────────────────────────
